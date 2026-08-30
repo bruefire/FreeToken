@@ -146,6 +146,22 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # Auxiliary short prefill-shaped forwards (for example speculative verify)
+    # can keep attention/linear-attention batching while routing MoE through its
+    # on-demand decode cache. Ordinary prefill keeps the full-layer path.
+    moe_decode_cache: bool = field(default=False, init=False)
+    # Fixed-length speculative verification is one sequence with multiple rows.
+    # CUDA-graph PLE and GDN update one recurrent state with the complete row block.
+    mtp_verify: bool = field(default=False, init=False)
+    # Number of accepted-prefix state checkpoints allocated for this verification
+    # graph. One checkpoint is written after each non-final target row.
+    mtp_checkpoint_capacity: int = field(default=0, init=False)
+    # Decode-only pages reserved past the ordinary one-token input. The scheduler
+    # releases any uncommitted suffix after a speculative result is drained.
+    speculative_allocated_ends: dict[Req, int] = field(default_factory=dict, init=False)
+    # Actual tokens emitted by this decode drain. Status reporting uses this for
+    # multi-token speculative outputs instead of assuming one token per request.
+    generated_tokens: int = field(default=0, init=False)
 
     @property
     def is_prefill(self) -> bool:

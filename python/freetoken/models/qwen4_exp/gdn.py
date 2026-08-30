@@ -107,6 +107,9 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
         self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
         self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
+        # MTP accepted-prefix checkpoints, written after each non-final verify row.
+        self._mtp_prefix_conv_state: torch.Tensor | None = None
+        self._mtp_prefix_recurrent_state: torch.Tensor | None = None
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
         # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
         # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
@@ -138,6 +141,61 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         ``conv_in`` [B, conv_dim] -> silu(conv) [B, conv_dim]."""
         li = pool.local_index(self.layer_id)
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
+
+    def _save_mtp_prefix_state(
+        self,
+        pool,
+        li: int,
+        indices: torch.Tensor,
+        checkpoint_index: int,
+        checkpoint_capacity: int,
+    ) -> None:
+        if not 0 <= checkpoint_index < checkpoint_capacity:
+            raise RuntimeError("MTP GDN checkpoint index is outside its capacity")
+        conv_state = pool.conv_states[li].index_select(0, indices)
+        recurrent_state = pool.recurrent_states[li].index_select(0, indices)
+        if conv_state.shape[0] != 1:
+            raise RuntimeError("MTP verification expects one GDN state slot")
+        conv_state = conv_state[0]
+        recurrent_state = recurrent_state[0]
+        conv_shape = (checkpoint_capacity, *conv_state.shape)
+        recurrent_shape = (checkpoint_capacity, *recurrent_state.shape)
+        if self._mtp_prefix_conv_state is None:
+            self._mtp_prefix_conv_state = torch.empty(
+                conv_shape, dtype=conv_state.dtype, device=conv_state.device
+            )
+        elif self._mtp_prefix_conv_state.shape != conv_shape:
+            # A captured verify graph holds this buffer's address; a silent
+            # reallocation would detach it from the graph.
+            raise RuntimeError("MTP GDN checkpoint geometry changed after capture")
+        if self._mtp_prefix_recurrent_state is None:
+            self._mtp_prefix_recurrent_state = torch.empty(
+                recurrent_shape,
+                dtype=recurrent_state.dtype,
+                device=recurrent_state.device,
+            )
+        elif self._mtp_prefix_recurrent_state.shape != recurrent_shape:
+            raise RuntimeError("MTP GDN checkpoint geometry changed after capture")
+        self._mtp_prefix_conv_state[checkpoint_index].copy_(conv_state)
+        self._mtp_prefix_recurrent_state[checkpoint_index].copy_(recurrent_state)
+
+    def commit_mtp_prefix_state(
+        self, pool, slot: int, checkpoint_index: int
+    ) -> None:
+        if (
+            self._mtp_prefix_conv_state is None
+            or self._mtp_prefix_recurrent_state is None
+        ):
+            raise RuntimeError("MTP GDN prefix state is not initialized")
+        if not 0 <= checkpoint_index < self._mtp_prefix_conv_state.shape[0]:
+            raise RuntimeError("MTP GDN checkpoint index is outside its capacity")
+        li = pool.local_index(self.layer_id)
+        pool.conv_states[li, slot].copy_(
+            self._mtp_prefix_conv_state[checkpoint_index]
+        )
+        pool.recurrent_states[li, slot].copy_(
+            self._mtp_prefix_recurrent_state[checkpoint_index]
+        )
 
     def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
                               h: torch.Tensor, fla) -> None:
@@ -181,7 +239,41 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if batch.mtp_verify:
+            # Fixed-row speculative verification: one sequence advances row by row with
+            # the decode kernels, saving an accepted-prefix checkpoint after each
+            # non-final row. Row count is fixed per captured verify graph.
+            rows = []
+            for row in range(total):
+                mixed = self._conv_decode(
+                    conv_in[row : row + 1], fla.cache_indices, pool
+                )
+                qf, kf, vf = torch.split(
+                    mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+                )
+                q = qf.reshape(1, 1, self.num_k_heads, self.head_k_dim).to(dtype)
+                k = kf.reshape(1, 1, self.num_k_heads, self.head_k_dim).to(dtype)
+                v = vf.reshape(1, 1, self.num_v_heads, self.head_v_dim).to(dtype)
+                rows.append(
+                    gdn_decode_fla(
+                        q, k, v, a[row : row + 1], b[row : row + 1],
+                        A_log=self.A_log, dt_bias=self.dt_bias,
+                        state_source=pool.recurrent_states[li],
+                        indices=fla.cache_indices,
+                        cu_seqlens=fla.cu_seqlens,
+                        scale=self.head_k_dim ** -0.5,
+                    )
+                )
+                if row < total - 1:
+                    self._save_mtp_prefix_state(
+                        pool,
+                        li,
+                        fla.cache_indices,
+                        row,
+                        batch.mtp_checkpoint_capacity,
+                    )
+            core_out = torch.cat(rows, dim=1)
+        elif batch.is_decode:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import Any, Tuple
@@ -40,6 +41,10 @@ class Qwen4ExpArgs:
     index_head_dim: int
     index_budget: int
     index_ratio: int
+    # MTP speculative predictor (checkpoint ``mtp.*`` module); off unless
+    # FREETOKEN_QWEN4_MTP=1 and the checkpoint declares predictor layers.
+    mtp_enabled: bool = False
+    mtp_num_hidden_layers: int = 0
 
     @property
     def index_topk_blocks(self) -> int:
@@ -91,6 +96,37 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
             fill_value=float(args.ngram_boundary_token_id),
         ),
     )
+
+
+def _mtp_enabled() -> bool:
+    return os.getenv("FREETOKEN_QWEN4_MTP", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _parse_mtp(text: Any) -> int:
+    """Return the predictor depth (0 = disabled) after validating the MTP config."""
+    mtp_num_hidden_layers = int(getattr(text, "mtp_num_hidden_layers", 0) or 0)
+    if not _mtp_enabled() or mtp_num_hidden_layers <= 0:
+        return 0
+    if bool(getattr(text, "mtp_use_dedicated_embeddings", False)):
+        raise ValueError("Qwen4-Exp MTP requires shared token embeddings")
+    mtp_config = getattr(text, "mtp", None)
+    mtp_layer_types = list(
+        (mtp_config.get("layer_types") if isinstance(mtp_config, dict) else None)
+        or ["full_attention"] * mtp_num_hidden_layers
+    )
+    if len(mtp_layer_types) != mtp_num_hidden_layers or any(
+        layer_type not in {"full_attention", "qwen_sparse_attention"}
+        for layer_type in mtp_layer_types
+    ):
+        raise ValueError(
+            "Qwen4-Exp MTP currently requires full-attention predictor layers"
+        )
+    return mtp_num_hidden_layers
 
 
 def _quant_get(hf_config: Any):
@@ -183,6 +219,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
+    mtp_num_hidden_layers = _parse_mtp(text)
+    if mtp_num_hidden_layers:
+        # Predictor layers ride the full-attention group: their KV and indexer
+        # state live in the shared QSA pool at layer ids past the target stack.
+        full_ids += tuple(
+            range(len(layer_types), len(layer_types) + mtp_num_hidden_layers)
+        )
+
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
     ple_layer_ids = tuple(int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ()))
     for lid in ple_layer_ids:
@@ -251,6 +295,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_head_dim=int(text.indexer_head_dim),
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
+        mtp_enabled=mtp_num_hidden_layers > 0,
+        mtp_num_hidden_layers=mtp_num_hidden_layers,
     )
 
     return ModelConfig(

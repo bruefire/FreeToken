@@ -6,7 +6,9 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped: ``model.visual.*`` (served text-only), and ``mtp.*`` (speculative head) unless
+FREETOKEN_QWEN4_MTP=1; the stacked ``mtp.layers.0.mlp.experts.*`` always load separately
+via :func:`load_mtp_expert_banks`.
 """
 
 from __future__ import annotations
@@ -27,9 +29,13 @@ from freetoken.models.nvfp4_banks import (
     load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import download_hf_weight
+from freetoken.utils import download_hf_weight, init_logger
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
+
+from .config import _mtp_enabled
+
+logger = init_logger(__name__)
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
@@ -100,7 +106,13 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
+        if not _mtp_enabled():
+            return None
+        if ".mlp.experts." in raw_name:
+            return None  # stacked predictor experts: load_mtp_expert_banks
+        return raw_name
+    if raw_name.startswith(("model.visual.", "visual.")):
         return None
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
@@ -319,9 +331,190 @@ def load_nvfp4_expert_sources_parallel(
     )
 
 
+# ======================================================================================
+# MTP predictor experts
+# ======================================================================================
+
+
+def _quantize_fp8_block(
+    source: torch.Tensor,
+    weight_out: torch.Tensor,
+    scale_out: torch.Tensor,
+    *,
+    device: torch.device,
+    block: int = 128,
+    expert_chunk: int = 8,
+) -> None:
+    if source.ndim != 3 or weight_out.shape != source.shape:
+        raise ValueError("MTP FP8 expert banks must have matching [experts, out, in] shapes")
+    experts, out_features, in_features = source.shape
+    if out_features % block or in_features % block:
+        raise ValueError("MTP FP8 expert dimensions must be divisible by the block size")
+    expected_scales = (experts, out_features // block, in_features // block)
+    if scale_out.shape != expected_scales:
+        raise ValueError(
+            f"MTP FP8 scale bank has shape {tuple(scale_out.shape)}, expected {expected_scales}"
+        )
+    if weight_out.dtype != torch.float8_e4m3fn or scale_out.dtype != torch.bfloat16:
+        raise ValueError("MTP FP8 banks require float8_e4m3fn weights and BF16 scales")
+    if expert_chunk <= 0:
+        raise ValueError("MTP FP8 expert chunk must be positive")
+
+    for start in range(0, experts, expert_chunk):
+        end = min(start + expert_chunk, experts)
+        count = end - start
+        weight = source[start:end].to(device=device, dtype=torch.float32)
+        blocks = weight.view(
+            count,
+            out_features // block,
+            block,
+            in_features // block,
+            block,
+        ).permute(0, 1, 3, 2, 4)
+        scale = blocks.abs().amax(dim=(3, 4)).clamp_min(1e-10) / 448.0
+        scale = scale.to(torch.bfloat16)
+        quantized = (blocks / scale.float()[..., None, None]).clamp(-448.0, 448.0)
+        quantized = quantized.to(torch.float8_e4m3fn).permute(0, 1, 3, 2, 4).reshape(
+            count, out_features, in_features
+        )
+        weight_out[start:end].copy_(quantized)
+        scale_out[start:end].copy_(scale)
+
+
+def _mtp_expert_bank_specs(
+    experts: int,
+    hidden: int,
+    intermediate: int,
+    expert_quant: str,
+) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    if expert_quant == "bf16":
+        return {
+            "gate_up": ((experts, 2 * intermediate, hidden), torch.bfloat16),
+            "down": ((experts, hidden, intermediate), torch.bfloat16),
+        }
+    if expert_quant != "fp8_block":
+        raise ValueError(f"Unsupported Qwen4-Exp MTP expert quantization {expert_quant!r}")
+    from freetoken.moe.offload_cache import fp8_block_scale_pad
+
+    block = 128
+    if hidden % block or intermediate % block:
+        raise ValueError("Qwen4-Exp MTP FP8 expert dimensions must be divisible by 128")
+    # Scale banks keep the offload cache's padded trailing dim (fp8_block_scale_pad);
+    # the GEMMs read the real columns through explicit strides.
+    return {
+        "gate_up": ((experts, 2 * intermediate, hidden), torch.float8_e4m3fn),
+        "gate_up_scale": (
+            (
+                experts,
+                2 * intermediate // block,
+                fp8_block_scale_pad(2 * intermediate // block, hidden // block),
+            ),
+            torch.bfloat16,
+        ),
+        "down": ((experts, hidden, intermediate), torch.float8_e4m3fn),
+        "down_scale": (
+            (
+                experts,
+                hidden // block,
+                fp8_block_scale_pad(hidden // block, intermediate // block),
+            ),
+            torch.bfloat16,
+        ),
+    }
+
+
+def load_mtp_expert_banks(
+    model_path: str,
+    config,
+    *,
+    dummy: bool = False,
+    expert_quant: str = "bf16",
+    device: torch.device | None = None,
+):
+    """Read the stacked ``mtp.layers.0.mlp.experts.*`` tensors into pinned host banks.
+
+    ``expert_quant='fp8_block'`` converts the BF16 checkpoint experts to 128x128
+    block-FP8 while loading (halves the pinned bank and the predictor cache slot).
+    """
+    from freetoken.moe.expert_banks import ExpertBanks
+    from freetoken.moe.host_banks import PinPipeline, alloc_layer_banks
+
+    if not config.qwen4_args.mtp_enabled:
+        raise ValueError("Qwen4-Exp MTP expert loading requested while MTP is disabled")
+    if config.qwen4_args.mtp_num_hidden_layers != 1:
+        raise NotImplementedError("Qwen4-Exp currently supports one MTP layer")
+
+    experts = config.num_experts
+    hidden = config.hidden_size
+    intermediate = config.moe_intermediate_size
+    block = 128
+    specs = _mtp_expert_bank_specs(experts, hidden, intermediate, expert_quant)
+    host_banks = alloc_layer_banks(specs, 1)
+    if dummy:
+        for name, per_layer in host_banks.items():
+            per_layer[0].tensor.fill_(1 if name.endswith("_scale") else 0)
+        with PinPipeline() as pins:
+            pins(0, {name: per_layer[0] for name, per_layer in host_banks.items()})
+    else:
+        folder = download_hf_weight(model_path)
+        with open(
+            os.path.join(folder, "model.safetensors.index.json"),
+            encoding="utf-8",
+        ) as index_file:
+            weight_map = json.load(index_file)["weight_map"]
+        keys = {
+            "gate_up": "mtp.layers.0.mlp.experts.gate_up_proj",
+            "down": "mtp.layers.0.mlp.experts.down_proj",
+        }
+        paths = {
+            name: os.path.join(folder, weight_map[key]) for name, key in keys.items()
+        }
+        with PinPipeline() as pins:
+            for bank_name, key in keys.items():
+                path = paths[bank_name]
+                with safetensors.safe_open(
+                    path, framework="pt", device="cpu"
+                ) as handle:
+                    tensor = handle.get_tensor(key)
+                    destination = host_banks[bank_name][0].tensor
+                    if tensor.dtype != torch.bfloat16 or tensor.shape != destination.shape:
+                        raise RuntimeError(
+                            f"Unexpected Qwen4-Exp MTP expert tensor {key}: "
+                            f"{tensor.dtype} {tuple(tensor.shape)}"
+                        )
+                    if expert_quant == "bf16":
+                        destination.copy_(tensor)
+                    else:
+                        quant_device = device or torch.device(
+                            "cuda" if torch.cuda.is_available() else "cpu"
+                        )
+                        scale_bank = host_banks[f"{bank_name}_scale"][0].tensor
+                        real_cols = destination.shape[2] // block
+                        _quantize_fp8_block(
+                            tensor,
+                            destination,
+                            scale_bank[:, :, :real_cols],
+                            device=quant_device,
+                        )
+                pins.submit(host_banks[bank_name][0])
+                if expert_quant == "fp8_block":
+                    pins.submit(host_banks[f"{bank_name}_scale"][0])
+        for path in set(paths.values()):
+            drop_page_cache(path)
+
+    return ExpertBanks(
+        expert_quant,
+        {
+            name: [per_layer[0].tensor]
+            for name, per_layer in host_banks.items()
+        },
+    )
+
+
 __all__ = [
     "PleTable",
     "iter_weights",
+    "load_mtp_expert_banks",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
     "load_ple_table",

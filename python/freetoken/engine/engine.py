@@ -282,6 +282,8 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    num_tokens: int = 1
+    force_drain: bool = False
 
 
 class Engine:
@@ -326,15 +328,25 @@ class Engine:
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
+        self.auxiliary_runtime = None
         self.cpu_moe_executor = None
+        self.mtp_worker = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+        # The auxiliary runtime (MTP predictor bank) pins host memory too; count it
+        # before the bank residency planning even though it is allocated below.
+        aux_pinned_bytes = getattr(self.model, "auxiliary_pinned_memory_bytes", None)
+        if aux_pinned_bytes is not None:
+            self._host_tables_bytes += int(aux_pinned_bytes(config) or 0)
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
+        setup_auxiliary_runtime = getattr(self.model, "setup_auxiliary_runtime", None)
+        if setup_auxiliary_runtime is not None:
+            self.auxiliary_runtime = setup_auxiliary_runtime(config, self.device)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
 
@@ -390,6 +402,19 @@ class Engine:
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
+        # The scheduler may retain one sampled result while the next batch is
+        # launched. A two-slot pinned ring makes the sample D2H truly
+        # asynchronous (a pageable .to("cpu", non_blocking=True) is a blocking
+        # copy) without letting a later sample overwrite an undrained view.
+        sample_capacity = config.max_running_req * (
+            4 if getattr(self.model, "mtp", None) is not None else 1
+        )
+        self._sample_cpu_buffers = (
+            torch.empty(sample_capacity, dtype=torch.int32, pin_memory=True),
+            torch.empty(sample_capacity, dtype=torch.int32, pin_memory=True),
+        )
+        self._sample_copy_events = (torch.cuda.Event(), torch.cuda.Event())
+        self._sample_cpu_buffer_index = 0
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
@@ -424,6 +449,13 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        if getattr(self.model, "mtp", None) is not None:
+            from .mtp_worker import MTPWorker
+
+            self.mtp_worker = MTPWorker(self)
+            logger.info_rank0(
+                "Qwen4-Exp MTP enabled: single-request greedy verification"
+            )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -479,6 +511,11 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        auxiliary_bytes = getattr(
+            getattr(self, "model", None), "auxiliary_runtime_memory_bytes", None
+        )
+        if auxiliary_bytes is not None:
+            fixed_cache_size += auxiliary_bytes(config)
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -917,9 +954,38 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if self.mtp_worker is not None and self.mtp_worker.can_speculate(batch):
+            next_tokens_gpu, _ = self.mtp_worker.forward_decode(batch, args)
+            if self.cpu_moe_executor is not None:
+                self.cpu_moe_executor.raise_if_unhealthy()
+            next_tokens_cpu, copy_done_event = self._copy_sample_to_cpu(next_tokens_gpu)
+            return ForwardOutput(
+                next_tokens_gpu,
+                next_tokens_cpu,
+                copy_done_event,
+                num_tokens=next_tokens_gpu.numel(),
+                force_drain=True,
+            )
+
+        # A single greedy prefill also initializes the MTP predictor state, so the
+        # target forward returns its pre-mixer hidden rows alongside the logits.
+        mtp_prefill = (
+            self.mtp_worker is not None
+            and batch.is_prefill
+            and batch.size == 1
+            and batch.reqs[0].sampling_params.is_greedy
+        )
+        prefill_range = None
+        mtp_prefill_final = False
+        if mtp_prefill:
+            req = batch.reqs[0]
+            prefill_range = (req.cached_len, req.device_len)
+            mtp_prefill_final = req.can_decode
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
+            elif mtp_prefill:
+                logits, expanded = self.model.forward(return_expanded=True)
             else:
                 logits = self.model.forward()
         if self.cpu_moe_executor is not None:
@@ -932,10 +998,34 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        if mtp_prefill:
+            assert prefill_range is not None
+            self.mtp_worker.update_prefill(
+                batch,
+                expanded,
+                next_tokens_gpu,
+                start=prefill_range[0],
+                end=prefill_range[1],
+                final=mtp_prefill_final,
+            )
+        next_tokens_cpu, copy_done_event = self._copy_sample_to_cpu(next_tokens_gpu)
+        return ForwardOutput(
+            next_tokens_gpu,
+            next_tokens_cpu,
+            copy_done_event,
+            force_drain=self.mtp_worker is not None,
+        )
+
+    def _copy_sample_to_cpu(
+        self, tokens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.cuda.Event]:
+        sample_slot = self._sample_cpu_buffer_index
+        output = self._sample_cpu_buffers[sample_slot][: tokens.numel()]
+        self._sample_cpu_buffer_index ^= 1
+        output.copy_(tokens, non_blocking=True)
+        event = self._sample_copy_events[sample_slot]
+        event.record(self.stream)
+        return output, event
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1291,6 +1381,27 @@ def _adjust_config(config: EngineConfig):
             "cache_type",
             _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
         )
+
+    mtp_enabled = bool(
+        getattr(getattr(model_config, "qwen4_args", None), "mtp_enabled", False)
+    )
+    if mtp_enabled:
+        # Must follow the linear-attention cache resolution above so the naive
+        # override is not put back to hybrid_radix.
+        if config.max_running_req != 1:
+            override("max_running_req", 1)
+            logger.warning_rank0(
+                "Qwen4-Exp MTP currently supports one running request; "
+                "overriding max_running_req to 1"
+            )
+        override("cuda_graph_bs", [1])
+        override("cuda_graph_max_bs", 1)
+        if getattr(config, "cache_type", "radix") != "naive":
+            override("cache_type", "naive")
+            logger.warning_rank0(
+                "Qwen4-Exp MTP currently keeps predictor boundary state per request; "
+                "overriding cache_type to 'naive'"
+            )
 
     # Type x backend capability matrix: resolve auto from the per-type priority
     # lists, then validate whatever is now selected (explicit or auto) -- every

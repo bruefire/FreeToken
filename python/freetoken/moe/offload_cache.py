@@ -144,6 +144,10 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # Decode-only auxiliary predictors can keep a working set smaller than the
+    # full expert count. The default remains false because normal prefill needs
+    # room to materialize a complete layer.
+    allow_partial_cache: bool = False
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -420,8 +424,9 @@ class OffloadMoeCache:
         pre-teardown check, so an invalid target rejects with the old cache intact
         (no destructive free first).
         """
-        if cache_size < self.num_experts:
-            raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
+        minimum = 1 if self.allow_partial_cache else self.num_experts
+        if cache_size < minimum:
+            raise ValueError(f"cache_size {cache_size} < num_experts floor {minimum}")
         if self.quant_format == "nvfp4_marlin" and cache_size > MARLIN_MAX_CACHE_SIZE:
             raise ValueError(
                 f"moe_cache_size={cache_size} exceeds the marlin backend's slot limit of "

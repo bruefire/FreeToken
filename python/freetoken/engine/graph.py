@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
+import torch.nn.functional as F
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.utils import init_logger, mem_GB
@@ -19,23 +20,60 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def project_lm_head_all_positions(
+    lm_head, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """Project every hidden row instead of slicing to the last prefill row."""
+    module = getattr(lm_head, "tied_embedding", None) or lm_head
+    logits = F.linear(hidden_states, module.weight, getattr(lm_head, "bias", None))
+    tp_size = getattr(lm_head, "tp_size", 1)
+    if tp_size == 1:
+        return logits
+
+    output = lm_head._comm.all_gather(logits)
+    input_shape = logits.shape
+    output = output.view((tp_size,) + input_shape)
+    output = output.permute(1, 0, 2).contiguous()
+    output = output.reshape(input_shape[:1] + (tp_size * input_shape[1],))
+    return output[:, : lm_head.num_embeddings]
+
+
 @dataclass
 class GraphCaptureBuffer:
     input_ids: torch.Tensor
     out_loc: torch.Tensor
     positions: torch.Tensor
     logits: torch.Tensor
+    expanded_hidden: torch.Tensor | None
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
 
     @classmethod
-    def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
+    def init(
+        cls,
+        bs: int,
+        vocab_size: int,
+        device: torch.device,
+        *,
+        expanded_hidden_size: int = 0,
+        hidden_dtype: torch.dtype | None = None,
+    ) -> GraphCaptureBuffer:
         return GraphCaptureBuffer(
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
             out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
             positions=torch.zeros(bs, dtype=torch.int32, device=device),
             logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
+            expanded_hidden=(
+                torch.empty(
+                    bs,
+                    expanded_hidden_size,
+                    dtype=hidden_dtype,
+                    device=device,
+                )
+                if expanded_hidden_size
+                else None
+            ),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
         )
@@ -112,6 +150,7 @@ class GraphRunner:
             free_memory=free_memory,
         )
         self.attn_backend = attn_backend
+        self.model = model
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
@@ -145,7 +184,20 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
+        mtp = getattr(model, "mtp", None)
+        expanded_hidden_size = (
+            mtp.hc_count * mtp.hidden_size if mtp is not None else 0
+        )
+        hidden_dtype = (
+            model.model.embed_tokens.weight.dtype if expanded_hidden_size else None
+        )
+        self.buffer = GraphCaptureBuffer.init(
+            self.max_graph_bs,
+            vocab_size,
+            self.device,
+            expanded_hidden_size=expanded_hidden_size,
+            hidden_dtype=hidden_dtype,
+        )
         self._reset_moe_offload_cache()
 
         pbar = tqdm(
@@ -172,11 +224,21 @@ class GraphRunner:
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
             with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward()
+                if self.buffer.expanded_hidden is None:
+                    self.buffer.logits[:bs] = model.forward()
+                else:
+                    logits, expanded = model.forward(return_expanded=True)
+                    self.buffer.logits[:bs] = logits
+                    self.buffer.expanded_hidden[:bs] = expanded
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self.buffer.logits[:bs] = model.forward()
+                    if self.buffer.expanded_hidden is None:
+                        self.buffer.logits[:bs] = model.forward()
+                    else:
+                        logits, expanded = model.forward(return_expanded=True)
+                        self.buffer.logits[:bs] = logits
+                        self.buffer.expanded_hidden[:bs] = expanded
                 self._reset_moe_offload_cache()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
@@ -189,13 +251,20 @@ class GraphRunner:
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs
 
-    def replay(self, batch: Batch) -> torch.Tensor:
+    def replay(
+        self, batch: Batch, *, return_expanded: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
-        return self.buffer.logits[: batch.size]
+        logits = self.buffer.logits[: batch.size]
+        if return_expanded:
+            if self.buffer.expanded_hidden is None:
+                raise RuntimeError("CUDA graph does not capture expanded hidden states")
+            return logits, self.buffer.expanded_hidden[: batch.size]
+        return logits
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size

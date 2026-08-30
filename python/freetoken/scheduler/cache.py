@@ -281,6 +281,30 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def release_allocated_tail(
+        self, req: Req, *, keep_end: int, allocated_end: int
+    ) -> None:
+        """Return speculative pages in ``[keep_end, allocated_end)``.
+
+        A partial page containing committed tokens stays owned by the request, so
+        the release is page-rounded (the QSA pool serves page_size=64).
+        """
+        if not 0 <= keep_end <= allocated_end:
+            raise ValueError(
+                f"invalid allocated tail [{keep_end}, {allocated_end})"
+            )
+        first_page = div_ceil(keep_end, self.page_size)
+        last_page = div_ceil(allocated_end, self.page_size)
+        if last_page <= first_page:
+            return
+        start = first_page * self.page_size
+        end = last_page * self.page_size
+        indices = self.page_table[req.table_idx, start:end]
+        if self.swa_paged:
+            self._free_swa(indices)
+        self._free(indices)
+        self.page_table[req.table_idx, start:end] = 0
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)

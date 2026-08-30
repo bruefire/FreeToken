@@ -334,6 +334,22 @@ def build_ple_metadata(
     fla = getattr(batch, "fla_metadata", None)
     slots_dev = getattr(batch, "linear_table_idx", None)
 
+    if getattr(batch, "mtp_verify", False) and fla is not None:
+        # Fixed-row MTP verification: one request, fla carries the GDN per-row
+        # metadata (cu_seqlens [0,1]), so build the token indptr [0,T] here from
+        # device-only ops (the whole forward is CUDA-graph captured).
+        slots = fla.cache_indices.long()
+        total = int(batch.input_ids.numel())
+        return PLEMetadata(
+            input_ids=batch.input_ids,
+            cu_seqlens=torch.arange(2, dtype=torch.int64, device=device) * total,
+            seq_lens=(total,),
+            ngram_context=context_pool.index_select(0, slots).long(),
+            state_slots=slots,
+            fresh_slots=None,
+            is_decode=False,
+        )
+
     if batch.is_decode and slots_dev is not None:
         slots = slots_dev.long()
         bs = slots.numel()
@@ -567,6 +583,8 @@ class PLELayer(BaseOP):
             f"PLE conv history {self.state_len} exceeds CHUNK_SIZE {CHUNK_SIZE}"
         )
         self._pending: Tuple[PLEMetadata, torch.Tensor] | None = None
+        # MTP accepted-prefix conv checkpoints, written after each non-final verify row.
+        self._mtp_prefix_conv_state: torch.Tensor | None = None
 
     def start_prefetch(self, batch: Batch, meta: PLEMetadata | None = None) -> None:
         """Hash this forward's n-grams and start the table gather on the side stream."""
@@ -605,6 +623,10 @@ class PLELayer(BaseOP):
         gated = (gate * value.unsqueeze(-2)).flatten(-2)
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
         x = self.norm_conv.forward(gated)
+        if batch is not None and getattr(batch, "mtp_verify", False):
+            return gated + self._mtp_verify_conv(
+                x, meta, states, batch.mtp_checkpoint_capacity
+            )
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
@@ -643,6 +665,62 @@ class PLELayer(BaseOP):
         if meta.is_decode:
             return self._decode_conv(x, meta, states)
         return self._prefill_conv(x, meta, states)
+
+    def _mtp_verify_conv(
+        self,
+        x: torch.Tensor,
+        meta: PLEMetadata,
+        states: torch.Tensor,
+        checkpoint_capacity: int,
+    ) -> torch.Tensor:
+        """One packed conv over ``[state | rows]``; each non-final row's post-row conv
+        history is a sliding window of that packed history, saved as a checkpoint."""
+        if len(meta.seq_lens) != 1:
+            raise RuntimeError("Qwen4-Exp MTP PLE expects one request")
+        state = self._read_state(meta, states, x.dtype)  # [1, width, state_len]
+        current = x.transpose(0, 1).unsqueeze(0)  # [1, width, T]
+        combined = torch.cat([state, current], dim=-1)
+        out = F.conv1d(
+            combined,
+            self.conv1d.weight,
+            groups=self.conv1d.weight.shape[0],
+            dilation=self.dilation,
+        )
+        for checkpoint_index in range(x.shape[0] - 1):
+            start = checkpoint_index + 1
+            self._save_mtp_prefix_state(
+                combined[0, :, start : start + self.state_len],
+                checkpoint_index,
+                checkpoint_capacity,
+            )
+        states.index_copy_(
+            0, meta.state_slots, combined[..., -self.state_len :].to(states.dtype)
+        )
+        return F.silu(out.squeeze(0).transpose(0, 1))
+
+    def _save_mtp_prefix_state(
+        self, state: torch.Tensor, checkpoint_index: int, checkpoint_capacity: int
+    ) -> None:
+        if not 0 <= checkpoint_index < checkpoint_capacity:
+            raise RuntimeError("MTP PLE checkpoint index is outside its capacity")
+        expected = (checkpoint_capacity, *state.shape)
+        if self._mtp_prefix_conv_state is None:
+            self._mtp_prefix_conv_state = torch.empty(
+                expected, dtype=state.dtype, device=state.device
+            )
+        elif self._mtp_prefix_conv_state.shape != expected:
+            # A captured verify graph holds this buffer's address; a silent
+            # reallocation would detach it from the graph.
+            raise RuntimeError("MTP PLE checkpoint geometry changed after capture")
+        self._mtp_prefix_conv_state[checkpoint_index].copy_(state)
+
+    def commit_mtp_prefix_state(self, slot: int, checkpoint_index: int) -> None:
+        if self._mtp_prefix_conv_state is None:
+            raise RuntimeError("Qwen4-Exp MTP PLE prefix state is not initialized")
+        if not 0 <= checkpoint_index < self._mtp_prefix_conv_state.shape[0]:
+            raise RuntimeError("MTP PLE checkpoint index is outside its capacity")
+        states = self._conv_state_slab(self._mtp_prefix_conv_state)
+        states[slot].copy_(self._mtp_prefix_conv_state[checkpoint_index])
 
     def _decode_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor

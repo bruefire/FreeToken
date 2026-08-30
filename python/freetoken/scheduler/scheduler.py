@@ -58,6 +58,13 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+def _drain_before_schedule(last_data: ForwardData | None) -> bool:
+    return last_data is not None and (
+        getattr(last_data[1], "num_tokens", 1) > 1
+        or getattr(last_data[1], "force_drain", False)
+    )
+
+
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
@@ -104,6 +111,12 @@ class Scheduler(SchedulerIOMixin):
         # terminal accounting acknowledgement has already been published.
         self._abort_tombstones: dict[int, None] = {}
         self._forward_iter = 0  # global forward counter; drives the SWA proactive-eviction cadence
+        # Reusable pinned staging for per-batch host inputs (positions / index
+        # tuples). Pinned allocation costs ~0.1-1ms each; a fresh set per batch
+        # is hidden by overlap scheduling but stands naked on the synchronous
+        # speculative drain path. Two slots alternate by forward parity so the
+        # in-flight batch's pending H2D copies are never overwritten.
+        self._host_staging: tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]] = ({}, {})
         # The launched-but-not-yet-drained batch (overlap): set at the top of each overlap_loop
         # iteration so the abort handler can tell whether a request's forward is still in flight
         # (mark it, defer the free to _process_last_data) or not (free immediately). Stays None
@@ -214,6 +227,15 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
+        # A speculative multi-token result rewrites req lengths and returns reserved
+        # pages; the next batch must be scheduled after that, so drain synchronously.
+        if _drain_before_schedule(last_data):
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
+            last_data = None
+            self._last_data = None
+
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
         # NOT a gate — those requests are already freed (no live GPU/page resources).
@@ -303,8 +325,16 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, forward_output = last_data[0].batch, last_data[1]
+        if hasattr(forward_output, "next_tokens_cpu"):
+            next_tokens_cpu = forward_output.next_tokens_cpu
+            copy_done = forward_output.copy_done_event
+            num_tokens = forward_output.num_tokens
+        else:
+            _, next_tokens_cpu, copy_done = forward_output
+            num_tokens = 1
         copy_done.synchronize()
+        batch.generated_tokens = 0
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -324,6 +354,7 @@ class Scheduler(SchedulerIOMixin):
                     # here (the forward is drained) and finish the request. No DetokenizeMsg --
                     # the abort ack flushed after this method stays the uid's terminal reply.
                     self.decode_manager.remove_req(req)
+                    Scheduler._release_speculative_tail(self, batch, req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
                     continue
@@ -334,8 +365,20 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
+                if num_tokens > 1:
+                    self._drain_multi_token(
+                        req,
+                        next_tokens_cpu,
+                        i,
+                        num_tokens,
+                        reply,
+                        new_finished_reqs,
+                        batch,
+                    )
+                    continue
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
+                batch.generated_tokens += 1
                 next_token = int(next_token.item())
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
@@ -370,6 +413,7 @@ class Scheduler(SchedulerIOMixin):
                         stop_strs=req.sampling_params.stop_strs or None,
                     )
                 )
+                Scheduler._release_speculative_tail(self, batch, req)
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -416,6 +460,85 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+
+    def _drain_multi_token(
+        self,
+        req: Req,
+        next_tokens_cpu: torch.Tensor,
+        req_index: int,
+        num_tokens: int,
+        reply: List[DetokenizeMsg],
+        new_finished_reqs: Set[Req],
+        batch: Batch,
+    ) -> None:
+        start = req_index * num_tokens
+        tokens = next_tokens_cpu[start : start + num_tokens]
+        emit_count = min(
+            tokens.numel(), max(req.max_device_len - req.input_ids.numel(), 0)
+        )
+        base_cached_len = req.cached_len
+        finished = False
+        for offset, token in enumerate(tokens[:emit_count]):
+            req.append_host(token.unsqueeze(0))
+            req.cached_len = base_cached_len + offset
+            req.device_len = req.cached_len + 1
+            batch.generated_tokens += 1
+            next_token = int(token.item())
+            hit_length = not req.can_decode
+            hit_eos = (
+                not req.sampling_params.ignore_eos
+                and next_token in self.eos_token_ids
+            )
+            matched_stop = (
+                self._match_stop_str(req)
+                if not hit_eos and req.sampling_params.stop_strs
+                else None
+            )
+            finished = hit_length or hit_eos or matched_stop is not None
+            finish_reason = (
+                ("stop" if hit_eos or matched_stop is not None else "length")
+                if finished
+                else None
+            )
+            if (
+                next_token == self.toolcall_anchor_id
+                and req.toolcall_anchor_len is None
+                and not finished
+            ):
+                req.toolcall_anchor_len = req.input_ids.numel()
+            reply.append(
+                DetokenizeMsg(
+                    uid=req.uid,
+                    next_token=next_token,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                    matched_stop=matched_stop,
+                    stop_strs=req.sampling_params.stop_strs or None,
+                )
+            )
+            if finished:
+                break
+
+        Scheduler._release_speculative_tail(self, batch, req)
+        if emit_count == 0:
+            # forward_decode bounds its output by remain_len, so an empty drain is
+            # an invariant break; finishing silently would hang the client (no
+            # terminal DetokenizeMsg), so fail loudly instead.
+            raise RuntimeError(
+                f"speculative drain emitted no tokens for uid {req.uid}"
+            )
+        if finished:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            new_finished_reqs.add(req)
+
+    def _release_speculative_tail(self, batch: Batch, req: Req) -> None:
+        allocated_end = batch.speculative_allocated_ends.pop(req, None)
+        if allocated_end is None:
+            return
+        self.cache_manager.release_allocated_tail(
+            req, keep_end=req.cached_len, allocated_end=allocated_end
+        )
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -777,12 +900,35 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
-        self.cache_manager.allocate_paged(batch.reqs)
+        speculative = []
+        mtp_worker = self.engine.mtp_worker
+        if mtp_worker is not None and mtp_worker.can_speculate(batch):
+            # Reserve decode pages for the draft rows; the drain returns any
+            # rejected tail through release_allocated_tail.
+            req = batch.reqs[0]
+            reserve_drafts = min(
+                mtp_worker.max_drafts,
+                mtp_worker.max_supported_drafts,
+                req.remain_len - 1,
+            )
+            original_end = req.device_len
+            allocated_end = original_end + reserve_drafts
+            req.device_len = allocated_end
+            speculative.append((req, original_end, allocated_end))
+        try:
+            self.cache_manager.allocate_paged(batch.reqs)
+        finally:
+            for req, original_end, _ in speculative:
+                req.device_len = original_end
+        batch.speculative_allocated_ends = {
+            req: allocated_end for req, _, allocated_end in speculative
+        }
         if batch.is_prefill:
             self._gather_multimodal(batch)
-        batch.positions = _make_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
+        host_slot = self._host_staging[self._forward_iter & 1]
+        batch.positions = _make_positions(batch, self.device, host_slot)
+        input_mapping = _make_input_tuple(batch, self.device, host_slot)
+        write_mapping = _make_write_tuple(batch, self.device, host_slot)
         batch.out_loc = self.engine.page_table[input_mapping]
         if self.engine.linear_state_pool is not None:
             if batch.is_decode:
@@ -869,14 +1015,44 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if forward_output.num_tokens == 1:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        else:
+            for i, req in enumerate(batch.reqs):
+                token_index = (i + 1) * forward_output.num_tokens - 1
+                position = req.device_len + forward_output.num_tokens - 2
+                self.token_pool[req.table_idx, position] = (
+                    forward_output.next_tokens_gpu[token_index]
+                )
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
 
-def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+def _host_buffer(
+    buffers: dict[str, torch.Tensor],
+    name: str,
+    size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a persistent, grow-only pinned CPU staging view."""
+    buffer = buffers.get(name)
+    if buffer is None or buffer.numel() < size or buffer.dtype != dtype:
+        capacity = max(1, 1 << max(0, size - 1).bit_length())
+        buffer = torch.empty(
+            capacity,
+            dtype=dtype,
+            device="cpu",
+            pin_memory=torch.cuda.is_available(),
+        )
+        buffers[name] = buffer
+    return buffer[:size]
+
+
+def _make_positions(
+    batch: Batch, device: torch.device, host: dict[str, torch.Tensor]
+) -> torch.Tensor:
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+    indices_host = _host_buffer(host, "positions", needed_size, torch.int32)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -890,8 +1066,10 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     return indices_host.to(device, non_blocking=True)
 
 
-def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+def _make_input_tuple(
+    batch: Batch, device: torch.device, host: dict[str, torch.Tensor]
+) -> Indice2D:
+    mapping_host = _host_buffer(host, "input_mapping", len(batch.positions), torch.int64)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -900,9 +1078,12 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
     return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
 
 
-def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_list = [req.table_idx for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-    write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+def _make_write_tuple(
+    batch: Batch, device: torch.device, host: dict[str, torch.Tensor]
+) -> Indice2D:
+    mapping_host = _host_buffer(host, "write_mapping", len(batch.reqs), torch.int64)
+    write_host = _host_buffer(host, "write_positions", len(batch.reqs), torch.int64)
+    for i, req in enumerate(batch.reqs):
+        mapping_host[i] = req.table_idx
+        write_host[i] = req.device_len if req.can_decode else -1
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)

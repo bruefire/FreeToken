@@ -99,13 +99,17 @@ class Qwen4ExpModel(BaseOP):
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
+        # MTP accepted-prefix checkpoints of the shared ple_ngram_ctx window
+        self._mtp_prefix_ngram_ctx: torch.Tensor | None = None
 
     @property
     def ple_layers(self) -> List[PLELayer]:
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
-    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, batch: Batch, *, return_expanded: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
         meta = None
         if self._ple:
@@ -119,14 +123,66 @@ class Qwen4ExpModel(BaseOP):
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
-            commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+            if batch.mtp_verify:
+                self._commit_mtp_ngram_context(meta, batch.mtp_checkpoint_capacity)
+            else:
+                commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        return (mixed, hidden) if return_expanded else mixed
+
+    def _commit_mtp_ngram_context(self, meta, checkpoint_capacity: int) -> None:
+        """Verify-forward sibling of ``commit_ngram_context``: roll the window past all
+        rows, and save the window after each non-final row so a rejected suffix can
+        restore the accepted prefix's context."""
+        from .ple import _ngram_context_pool
+
+        context_pool = _ngram_context_pool()
+        ids = meta.input_ids.to(meta.ngram_context.dtype)
+        total = ids.numel()
+        full = torch.cat([meta.ngram_context[0], ids])
+        ctx_len = meta.ngram_context.shape[1]
+        expected = (checkpoint_capacity, ctx_len)
+        if self._mtp_prefix_ngram_ctx is None:
+            self._mtp_prefix_ngram_ctx = torch.empty(
+                expected, dtype=full.dtype, device=full.device
+            )
+        elif self._mtp_prefix_ngram_ctx.shape != expected:
+            # A captured verify graph holds this buffer's address; a silent
+            # reallocation would detach it from the graph.
+            raise RuntimeError("MTP ngram checkpoint geometry changed after capture")
+        for row in range(total - 1):
+            self._mtp_prefix_ngram_ctx[row].copy_(full[row + 1 : row + 1 + ctx_len])
+        context_pool.index_copy_(
+            0, meta.state_slots, full[total : total + ctx_len].unsqueeze(0).to(context_pool.dtype)
+        )
+
+    def commit_mtp_prefix_state(self, pool, slot: int, checkpoint_index: int) -> None:
+        for layer in self.layers.op_list:
+            mixer = getattr(layer, "linear_attn", None)
+            if mixer is not None:
+                mixer.commit_mtp_prefix_state(pool, slot, checkpoint_index)
+            if layer.ple is not None:
+                layer.ple.commit_mtp_prefix_state(slot, checkpoint_index)
+        if self._ple:
+            if self._mtp_prefix_ngram_ctx is None:
+                raise RuntimeError("Qwen4-Exp MTP ngram context is not initialized")
+            from .ple import _ngram_context_pool
+
+            _ngram_context_pool()[slot].copy_(
+                self._mtp_prefix_ngram_ctx[checkpoint_index]
+            )
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
+        if config.qwen4_args.mtp_enabled:
+            from .mtp import MTPModule
+
+            self.mtp = MTPModule(config)
+        else:
+            self.mtp = None
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
 
@@ -179,9 +235,58 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
         return table.bank.nbytes
 
-    def forward(self) -> torch.Tensor:
+    def _iter_offload_moe_layers(self):
+        # The MTP predictor's MoE layer owns a private cache (setup_auxiliary_runtime);
+        # keep it out of the main offload-cache attach walk.
+        for layer in self.model.layers.op_list:
+            yield layer.mlp.experts
+
+    def auxiliary_runtime_memory_bytes(self, config) -> int:
+        if self.mtp is None:
+            return 0
+        from .mtp import mtp_runtime_memory_bytes
+
+        return mtp_runtime_memory_bytes(config)
+
+    def auxiliary_pinned_memory_bytes(self, config) -> int:
+        if self.mtp is None:
+            return 0
+        from .mtp import mtp_pinned_memory_bytes
+
+        return mtp_pinned_memory_bytes(config)
+
+    def setup_auxiliary_runtime(self, config, device: torch.device):
+        from .mtp import setup_mtp_runtime
+
+        return setup_mtp_runtime(self, config, device)
+
+    def forward(
+        self, *, return_expanded: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        output = self.model.forward(
+            batch.input_ids, batch, return_expanded=return_expanded
+        )
+        if return_expanded:
+            mixed, expanded = output
+            return self.lm_head.forward(mixed), expanded
+        return self.lm_head.forward(output)
+
+    def commit_mtp_prefix_state(self, req, linear_pool, checkpoint_index: int) -> None:
+        slot = (
+            req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+        )
+        self.model.commit_mtp_prefix_state(linear_pool, slot, checkpoint_index)
+
+    def mtp_forward(
+        self, expanded_hidden: torch.Tensor, next_token_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mtp is None:
+            raise RuntimeError("Qwen4-Exp MTP is disabled")
+        batch = get_global_ctx().batch
+        token_embeddings = self.model.embed_tokens.forward(next_token_ids)
+        mixed, expanded = self.mtp.forward(expanded_hidden, token_embeddings, batch)
+        return self.lm_head.forward(mixed), expanded
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]

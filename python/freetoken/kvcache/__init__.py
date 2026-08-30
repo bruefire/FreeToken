@@ -190,9 +190,11 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
+        # The MTP predictor layer rides this group at ids past the decoder stack,
+        # so the dense layer map must cover the group's highest id.
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=max(model_config.num_layers, max(spec.layer_ids) + 1),
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,

@@ -168,3 +168,34 @@ def test_eos_token_id_list_uses_the_first_entry():
     hf = _hf_config()
     hf.text_config.eos_token_id = [base, base + 1]
     assert parse_config(hf).qwen4_args.ngram_boundary_token_id == base
+
+
+def test_mtp_parse_appends_predictor_layer(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP", "1")
+    hf = _hf_config()
+    hf.text_config.mtp_num_hidden_layers = 1
+    cfg = parse_config(hf)
+    assert cfg.qwen4_args.mtp_enabled
+    assert cfg.qwen4_args.mtp_num_hidden_layers == 1
+    full = [g for g in cfg.attention_groups if isinstance(g, FullAttentionGroupConfig)]
+    assert full[0].layer_ids[-1] == 48
+    assert full[0].num_index_layers == 13
+    assert cfg.num_layers == 48
+
+
+def test_mtp_disabled_without_env(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_QWEN4_MTP", raising=False)
+    hf = _hf_config()
+    hf.text_config.mtp_num_hidden_layers = 1
+    cfg = parse_config(hf)
+    assert not cfg.qwen4_args.mtp_enabled
+    assert cfg.qwen4_args.mtp_num_hidden_layers == 0
+
+
+def test_mtp_rejects_dedicated_embeddings(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP", "1")
+    hf = _hf_config()
+    hf.text_config.mtp_num_hidden_layers = 1
+    hf.text_config.mtp_use_dedicated_embeddings = True
+    with pytest.raises(ValueError, match="shared token embeddings"):
+        parse_config(hf)
