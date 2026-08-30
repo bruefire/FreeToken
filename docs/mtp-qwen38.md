@@ -42,6 +42,24 @@ Off by default. Everything is opt-in via environment variables:
 | `FREETOKEN_QWEN4_MTP_ADAPTIVE` | `1` | request-local fallback to ordinary decode |
 | `FREETOKEN_QWEN4_MTP_ADAPTIVE_CYCLES` | `64` | observation window before the fallback decision |
 | `FREETOKEN_QWEN4_MTP_ADAPTIVE_MIN_ACCEPTANCE` | `0.75` | minimum accepted drafts per cycle to keep speculating |
+| `FREETOKEN_QWEN4_MTP_POS_SHIFT` | `0` | experimental (untested on GPU): see below |
+| `FREETOKEN_QWEN4_MTP_DYNAMIC_DRAFTS` | `0` | experimental (untested on GPU): see below |
+| `FREETOKEN_QWEN4_MTP_DYNAMIC_WINDOW` | `32` | dynamic-draft observation window, cycles |
+| `FREETOKEN_QWEN4_MTP_DYNAMIC_HI` / `_LO` | `0.85` / `0.72` | dynamic-draft acceptance band edges |
+
+Two experimental knobs default off pending a real-hardware A/B; CPU contract
+tests cover them, GPU behavior is unvalidated:
+
+- `POS_SHIFT=1` places each predictor row at the token's own position and KV
+  slot (`i+1`) instead of the source hidden row's (`i`), seeding a zeroed
+  virtual row at slot 0. RoPE is relative, so the only effect is where the QSA
+  indexer's absolute 4-token group boundaries fall - potentially an acceptance
+  change in either direction, depending on which convention training used.
+- `DYNAMIC_DRAFTS=1` steps the draft depth 3<->2<->1 from windowed per-draft
+  acceptance. Under expert offload a verify row costs ~0.5x an ordinary token,
+  so depth 3 only wins above roughly 0.85 per-draft acceptance, and the middle
+  band (prose/tool content) should sit at depth 2 or 1. The full retreat to
+  ordinary decode remains the adaptive fallback's job.
 
 Current restrictions: greedy sampling, one running request, TP=1, offload
 family MoE backends, naive cache (forced automatically). The API only takes
@@ -90,8 +108,13 @@ from batch-shape BF16 reduction order remain possible.
 
 Known limitation: predictor prefill costs roughly 0.7-0.9 s per request on
 this machine (more when cold), so short outputs are end-to-end neutral to
-negative; long generations converge to the decode ratios above. Lazy or
-cheaper predictor prefill is the main follow-up.
+negative; long generations converge to the decode ratios above. A likely
+driver is chunking: the eager predictor prefill runs in
+`FREETOKEN_QWEN4_MTP_MOE_CACHE_SIZE // num_experts_per_tok` = 6-token chunks
+with the defaults (so a 500-token prompt is ~84 serial forwards), and raising
+the cache size widens the chunks proportionally at ~9 MB VRAM per slot -
+untested but the cheapest lever to try. Lazy or cheaper predictor prefill is
+the main follow-up.
 
 Known worst case: content the predictor cannot anticipate (e.g. gibberish
 input) makes most cycles all-rejection - each costs about 2.5x an ordinary
