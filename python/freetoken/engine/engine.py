@@ -1009,11 +1009,20 @@ class Engine:
                 final=mtp_prefill_final,
             )
         next_tokens_cpu, copy_done_event = self._copy_sample_to_cpu(next_tokens_gpu)
+        # A request the worker permanently fell back on regains overlap
+        # scheduling; temporary reasons keep the synchronous drain so the
+        # worker sees a current host history when it resumes.
+        mtp_ordinary_decode = (
+            self.mtp_worker is not None
+            and batch.is_decode
+            and batch.size == 1
+            and self.mtp_worker.ordinary_decode_selected(batch.reqs[0])
+        )
         return ForwardOutput(
             next_tokens_gpu,
             next_tokens_cpu,
             copy_done_event,
-            force_drain=self.mtp_worker is not None,
+            force_drain=self.mtp_worker is not None and not mtp_ordinary_decode,
         )
 
     def _copy_sample_to_cpu(

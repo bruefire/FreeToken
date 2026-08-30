@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -62,6 +63,43 @@ def _mtp_max_drafts() -> int:
         raise ValueError("FREETOKEN_QWEN4_MTP_MAX_DRAFTS must be 1, 2, or 3") from error
     if value not in (1, 2, 3):
         raise ValueError("FREETOKEN_QWEN4_MTP_MAX_DRAFTS must be 1, 2, or 3")
+    return value
+
+
+def _mtp_adaptive_enabled() -> bool:
+    value = os.getenv("FREETOKEN_QWEN4_MTP_ADAPTIVE", "1").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("FREETOKEN_QWEN4_MTP_ADAPTIVE must be a boolean")
+
+
+def _mtp_adaptive_cycles() -> int:
+    raw = os.getenv("FREETOKEN_QWEN4_MTP_ADAPTIVE_CYCLES", "64").strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "FREETOKEN_QWEN4_MTP_ADAPTIVE_CYCLES must be positive"
+        ) from error
+    if value <= 0:
+        raise ValueError("FREETOKEN_QWEN4_MTP_ADAPTIVE_CYCLES must be positive")
+    return value
+
+
+def _mtp_adaptive_min_yield() -> float:
+    raw = os.getenv("FREETOKEN_QWEN4_MTP_ADAPTIVE_MIN_ACCEPTANCE", "0.75").strip()
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ValueError(
+            "FREETOKEN_QWEN4_MTP_ADAPTIVE_MIN_ACCEPTANCE must be non-negative"
+        ) from error
+    if value < 0.0:
+        raise ValueError(
+            "FREETOKEN_QWEN4_MTP_ADAPTIVE_MIN_ACCEPTANCE must be non-negative"
+        )
     return value
 
 
@@ -442,6 +480,16 @@ class MTPWorker:
         self.max_supported_drafts = _mtp_max_drafts()
         self.max_drafts = self.max_supported_drafts
         self.draft_p_min = _mtp_draft_p_min()
+        # Request-local fallback: after an observation period, a rolling accepted
+        # yield below the threshold reverts the request to ordinary decode. The
+        # switch is one-way because ordinary decode does not advance the
+        # recursive predictor state.
+        self.fallback_enabled = _mtp_adaptive_enabled()
+        self.fallback_cycles = _mtp_adaptive_cycles()
+        self.fallback_min_yield = _mtp_adaptive_min_yield()
+        self.fallback_uid: int | None = None
+        self._accept_history: deque[int] = deque(maxlen=self.fallback_cycles)
+        self._request_cycles = 0
         self.metrics = MTPMetrics()
         self.log_interval = max(
             0, int(os.getenv("FREETOKEN_QWEN4_MTP_LOG_INTERVAL", "40"))
@@ -478,6 +526,9 @@ class MTPWorker:
         self.pending_draft = None
         self.pending_predictor_hidden = None
         self.pending_draft_confidence = 1.0
+        self.fallback_uid = None
+        self._accept_history.clear()
+        self._request_cycles = 0
 
     def reset_metrics(self) -> None:
         self.metrics = MTPMetrics()
@@ -523,11 +574,15 @@ class MTPWorker:
         return (
             req.sampling_params.is_greedy
             and req.remain_len >= 2
+            and self.fallback_uid != req.uid
             and self.uid == req.uid
             and self.pending_hidden is None
             and self.pending_draft is not None
             and self.predictor_cached_len == req.cached_len
         )
+
+    def ordinary_decode_selected(self, req: Req) -> bool:
+        return self.fallback_uid == req.uid
 
     def update_prefill(
         self,
@@ -723,6 +778,19 @@ class MTPWorker:
         self.metrics.proposed_drafts += draft_tokens.numel()
         self.metrics.accepted_drafts += accepted_count
         self.metrics.emitted_tokens += output.numel()
+        if self.fallback_enabled:
+            self._accept_history.append(accepted_count)
+            self._request_cycles += 1
+            if self._request_cycles >= self.fallback_cycles:
+                accepted_yield = sum(self._accept_history) / len(self._accept_history)
+                if accepted_yield < self.fallback_min_yield:
+                    self.fallback_uid = req.uid
+                    logger.info_rank0(
+                        "Qwen4-Exp MTP fallback: "
+                        f"cycle={self._request_cycles}, "
+                        f"accepted_yield={accepted_yield:.3f}, "
+                        "ordinary decode selected"
+                    )
         if self.timing_enabled and len(self.metrics.cycle_trace) < 4096:
             self.metrics.cycle_trace.append(
                 {

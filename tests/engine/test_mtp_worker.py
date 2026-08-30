@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -8,6 +9,9 @@ from freetoken.core import Batch, Req, SamplingParams
 from freetoken.engine.mtp_worker import (
     MTPMetrics,
     MTPWorker,
+    _mtp_adaptive_cycles,
+    _mtp_adaptive_enabled,
+    _mtp_adaptive_min_yield,
     _mtp_draft_p_min,
     _mtp_max_drafts,
 )
@@ -40,6 +44,18 @@ def test_mtp_draft_environment_is_validated(monkeypatch):
     with pytest.raises(ValueError, match="between 0 and 1"):
         _mtp_draft_p_min()
 
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_ADAPTIVE", "off")
+    assert not _mtp_adaptive_enabled()
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_ADAPTIVE", "maybe")
+    with pytest.raises(ValueError, match="boolean"):
+        _mtp_adaptive_enabled()
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_ADAPTIVE_CYCLES", "0")
+    with pytest.raises(ValueError, match="positive"):
+        _mtp_adaptive_cycles()
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_ADAPTIVE_MIN_ACCEPTANCE", "-1")
+    with pytest.raises(ValueError, match="non-negative"):
+        _mtp_adaptive_min_yield()
+
 
 def test_mtp_can_speculate_only_for_initialized_single_request():
     req = _req([10, 11, 12])
@@ -50,8 +66,13 @@ def test_mtp_can_speculate_only_for_initialized_single_request():
     worker.predictor_cached_len = req.cached_len
     worker.pending_hidden = None
     worker.pending_draft = torch.tensor([7], dtype=torch.int32)
+    worker.fallback_uid = None
 
     assert worker.can_speculate(batch)
+
+    worker.fallback_uid = req.uid
+    assert not worker.can_speculate(batch)
+    worker.fallback_uid = None
 
     other = _req([10, 11, 12])
     other.uid = req.uid + 1
@@ -75,6 +96,9 @@ def test_mtp_prefill_keeps_hidden_and_next_token_alignment_across_chunks():
     worker.max_supported_drafts = 1
     worker.max_drafts = 1
     worker.draft_p_min = 0.0
+    worker.fallback_uid = None
+    worker._accept_history = deque(maxlen=64)
+    worker._request_cycles = 0
     calls = []
 
     def run_predictor(self, batch, req, hidden, token_ids, source_start):
@@ -156,6 +180,12 @@ def _decode_worker(
     worker.log_interval = 0
     worker.timing_enabled = False
     worker.timing_events = []
+    worker.fallback_enabled = False
+    worker.fallback_cycles = 64
+    worker.fallback_min_yield = 0.75
+    worker.fallback_uid = None
+    worker._accept_history = deque(maxlen=64)
+    worker._request_cycles = 0
     extensions = []
     predictors = []
     prefix_commits = []
@@ -380,6 +410,53 @@ def test_mtp_three_drafts_commit_four_rows_when_all_are_accepted():
     assert worker.predictor_cached_len == 6
     assert worker.metrics.proposed_drafts == 3
     assert worker.metrics.accepted_drafts == 3
+
+
+def test_mtp_fallback_selects_ordinary_after_low_accepted_yield():
+    req = _req([10, 11, 12])
+    req.cached_len = 2
+    batch = Batch(reqs=[req], phase="decode")
+    batch.input_ids = torch.tensor([12], dtype=torch.int32)
+    worker, _extensions, _predictors, _commits = _decode_worker(
+        req, [8], predictor_outputs=[4, 4]
+    )
+    worker.fallback_enabled = True
+    worker.fallback_cycles = 2
+    worker._accept_history = deque(maxlen=2)
+
+    worker.forward_decode(batch, SimpleNamespace())
+    assert worker.fallback_uid is None
+
+    worker.forward_decode(batch, SimpleNamespace())
+    assert worker.fallback_uid == req.uid
+    assert worker.ordinary_decode_selected(req)
+    assert not worker.can_speculate(batch)
+
+    # a new request resets the window and re-enables speculation
+    worker.reset(req.uid + 1)
+    assert worker.fallback_uid is None
+    assert worker._request_cycles == 0
+
+
+def test_mtp_fallback_keeps_speculating_at_high_yield():
+    req = _req([10, 11, 12])
+    req.cached_len = 2
+    batch = Batch(reqs=[req], phase="decode")
+    batch.input_ids = torch.tensor([12], dtype=torch.int32)
+    worker, _extensions, _predictors, _commits = _decode_worker(
+        req, [7, 9], predictor_outputs=[7, 7]
+    )
+    worker.fallback_enabled = True
+    worker.fallback_cycles = 2
+    worker._accept_history = deque(maxlen=2)
+
+    worker.forward_decode(batch, SimpleNamespace())
+    # emulate the scheduler drain of the 2-token output before the next cycle
+    req.cached_len = worker.predictor_cached_len
+    req.device_len = req.cached_len + 1
+    worker.forward_decode(batch, SimpleNamespace())
+    assert worker.fallback_uid is None
+    assert not worker.ordinary_decode_selected(req)
 
 
 def test_mtp_second_draft_confidence_gate_verifies_only_first_draft():
