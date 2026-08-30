@@ -46,6 +46,21 @@ the speculative path when the request resolves as greedy - with the model's
 default sampling (`top_p=0.95`) that means passing `temperature=0` AND
 `top_p=1`.
 
+## Memory footprint
+
+MTP itself adds only the predictor expert bank to the pinned load: ~4.69 GiB
+in bf16, ~2.34 GiB with `FREETOKEN_QWEN4_MTP_EXPERT_QUANT=fp8_block`, plus a
+~0.6 GiB GPU cache (64 slots, budgeted before the main MoE/KV pools).
+
+On stock main the full model still needs the ~111 GiB pinned load (47.7 GiB
+PLE table + 63.5 GiB expert banks), which does not fit a 128 GB machine. The
+combination that does fit - and the one every number below was measured on -
+is this branch stacked on PR #279 (`--ple-backend mmap`): pinned memory drops
+to the expert banks plus the predictor (~66 GiB), and MTP works unchanged on
+top, including inside the mmap PLE's CUDA-graph staging. So a 128 GB RAM
+machine runs Qwen3.8 with MTP today via #279 + this branch; neither branch
+depends on the other.
+
 ## Measurements
 
 RTX 5090 (32 GB) + 125 GiB RAM, WSL2, CUDA 13,
