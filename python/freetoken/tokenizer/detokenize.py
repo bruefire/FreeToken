@@ -91,6 +91,17 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        uids = [msg.uid for msg in msgs]
+        if len(set(uids)) == len(uids):
+            return self._detokenize_batched(msgs)
+        # The worker drains its queue in batches, so one request's tokens from
+        # consecutive steps can arrive together (and a speculative multi-token
+        # drain produces this every cycle). The read/surr windows below must
+        # advance between those tokens or every later delta re-sends the earlier
+        # ones, so decode them one at a time.
+        return [self._detokenize_batched([msg])[0] for msg in msgs]
+
+    def _detokenize_batched(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:
