@@ -66,6 +66,56 @@ def _mtp_max_drafts() -> int:
     return value
 
 
+def _mtp_pos_shift() -> int:
+    raw = os.getenv("FREETOKEN_QWEN4_MTP_POS_SHIFT", "0").strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError("FREETOKEN_QWEN4_MTP_POS_SHIFT must be 0 or 1") from error
+    if value not in (0, 1):
+        raise ValueError("FREETOKEN_QWEN4_MTP_POS_SHIFT must be 0 or 1")
+    return value
+
+
+def _mtp_dynamic_drafts_enabled() -> bool:
+    value = os.getenv("FREETOKEN_QWEN4_MTP_DYNAMIC_DRAFTS", "0").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("FREETOKEN_QWEN4_MTP_DYNAMIC_DRAFTS must be a boolean")
+
+
+def _mtp_dynamic_window() -> int:
+    raw = os.getenv("FREETOKEN_QWEN4_MTP_DYNAMIC_WINDOW", "32").strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "FREETOKEN_QWEN4_MTP_DYNAMIC_WINDOW must be positive"
+        ) from error
+    if value <= 0:
+        raise ValueError("FREETOKEN_QWEN4_MTP_DYNAMIC_WINDOW must be positive")
+    return value
+
+
+def _mtp_dynamic_thresholds() -> tuple[float, float]:
+    raw_hi = os.getenv("FREETOKEN_QWEN4_MTP_DYNAMIC_HI", "0.85").strip()
+    raw_lo = os.getenv("FREETOKEN_QWEN4_MTP_DYNAMIC_LO", "0.72").strip()
+    try:
+        hi = float(raw_hi)
+        lo = float(raw_lo)
+    except ValueError as error:
+        raise ValueError(
+            "FREETOKEN_QWEN4_MTP_DYNAMIC_HI/LO must be floats in [0, 1]"
+        ) from error
+    if not (0.0 <= lo <= hi <= 1.0):
+        raise ValueError(
+            "FREETOKEN_QWEN4_MTP_DYNAMIC_HI/LO must satisfy 0 <= LO <= HI <= 1"
+        )
+    return hi, lo
+
+
 def _mtp_adaptive_enabled() -> bool:
     value = os.getenv("FREETOKEN_QWEN4_MTP_ADAPTIVE", "1").strip().lower()
     if value in {"1", "true", "yes", "on"}:
@@ -203,6 +253,11 @@ class _FixedRowGraphBase:
         self.device = engine.device
         self.token_count = token_count
         self.page_size = engine.config.page_size
+        # Row-index shift applied at replay staging. 0 for the target graphs;
+        # the predictor graph takes FREETOKEN_QWEN4_MTP_POS_SHIFT so the row
+        # for token i+1 can sit at position/slot i+1 instead of i (QSA absolute
+        # group boundaries move with it; RoPE is relative and unaffected).
+        self.pos_shift = 0
 
         self.input_ids = torch.zeros(token_count, dtype=torch.int32, device=self.device)
         self.positions = torch.zeros_like(self.input_ids)
@@ -287,6 +342,7 @@ class _FixedRowGraphBase:
         )
 
     def _stage(self, req: Req, start: int) -> None:
+        start += self.pos_shift
         end = start + self.token_count
         page_table = self.engine.page_table
         torch.arange(
@@ -381,6 +437,7 @@ class _PredictorGraph(_FixedRowGraphBase):
         if token_count not in (1, 2, 3, 4):
             raise ValueError("MTP predictor graph supports one to four tokens")
         super().__init__(engine, token_count, uid=-3 - token_count)
+        self.pos_shift = _mtp_pos_shift()
         self.graph_pool = graph_pool
         hidden_width = self.model.mtp.hc_count * self.model.mtp.hidden_size
         hidden_dtype = self.model.model.embed_tokens.weight.dtype
@@ -480,6 +537,24 @@ class MTPWorker:
         self.max_supported_drafts = _mtp_max_drafts()
         self.max_drafts = self.max_supported_drafts
         self.draft_p_min = _mtp_draft_p_min()
+        # Experimental acceptance A/B: place each predictor row at the token's
+        # own position/slot (i+1) instead of the source hidden row's (i). Slot 0
+        # then holds a zeroed virtual row seeded per request.
+        self.pos_shift = _mtp_pos_shift()
+        if self.pos_shift and not isinstance(
+            engine.attn_backend, QSASparseAttnBackend
+        ):
+            raise NotImplementedError(
+                "FREETOKEN_QWEN4_MTP_POS_SHIFT requires the QSA sparse backend"
+            )
+        # Experimental graded draft depth: track per-draft acceptance over a
+        # rolling window and step max_drafts 3<->2<->1. Under expert offload a
+        # verify row costs ~0.5x an ordinary token, so the optimal depth drops
+        # with acceptance well before the full fallback threshold is reached.
+        self.dynamic_enabled = _mtp_dynamic_drafts_enabled()
+        self.dynamic_window = _mtp_dynamic_window()
+        self.dynamic_hi, self.dynamic_lo = _mtp_dynamic_thresholds()
+        self._dyn_history: deque[tuple[int, int]] = deque(maxlen=self.dynamic_window)
         # Request-local fallback: after an observation period, a rolling accepted
         # yield below the threshold reverts the request to ordinary decode. The
         # switch is one-way because ordinary decode does not advance the
@@ -529,6 +604,8 @@ class MTPWorker:
         self.fallback_uid = None
         self._accept_history.clear()
         self._request_cycles = 0
+        self.max_drafts = self.max_supported_drafts
+        self._dyn_history.clear()
 
     def reset_metrics(self) -> None:
         self.metrics = MTPMetrics()
@@ -584,6 +661,63 @@ class MTPWorker:
     def ordinary_decode_selected(self, req: Req) -> bool:
         return self.fallback_uid == req.uid
 
+    def _adjust_draft_depth(self, accepted: int, proposed: int) -> None:
+        """Step ``max_drafts`` by one from the windowed per-draft acceptance.
+
+        The window clears after every step so the next decision is based on
+        cycles run at the new depth; a full window at an unchanged depth simply
+        keeps sliding. Depth never exceeds ``max_supported_drafts`` and never
+        drops below one (the full retreat to ordinary decode stays the
+        fallback's job).
+        """
+        self._dyn_history.append((accepted, proposed))
+        if len(self._dyn_history) < self.dynamic_window:
+            return
+        proposed_total = sum(item[1] for item in self._dyn_history)
+        if proposed_total == 0:
+            return
+        acceptance = sum(item[0] for item in self._dyn_history) / proposed_total
+        # Offload cost model (cycle ~ 0.5 + 0.5 * rows ordinary-token units):
+        # depth 3 wins above ~0.85 per-draft acceptance, depth 2 in the middle
+        # band, depth 1 below ~0.72. Move one step toward the band's depth.
+        if acceptance >= self.dynamic_hi:
+            target = self.max_supported_drafts
+        elif acceptance >= self.dynamic_lo:
+            target = min(2, self.max_supported_drafts)
+        else:
+            target = 1
+        depth = self.max_drafts
+        if target > depth:
+            depth += 1
+        elif target < depth:
+            depth -= 1
+        if depth != self.max_drafts:
+            self.max_drafts = depth
+            self._dyn_history.clear()
+            logger.info_rank0(
+                "Qwen4-Exp MTP dynamic drafts: "
+                f"acceptance={acceptance:.3f}, depth={depth}"
+            )
+
+    def _seed_predictor_origin(self, req: Req) -> None:
+        """Zero the virtual predictor row at slot/position 0 (POS_SHIFT=1).
+
+        With the shift the predictor's first real row sits at slot 1, so the
+        group-0 compression (which fetches the missing member from the pending
+        ring) and any dense read of expanded block 0 must see a defined null
+        row instead of stale memory from the slot's previous occupant.
+        """
+        backend = self.engine.attn_backend
+        kvcache = backend.kvcache
+        layer_id = self.engine.config.model_config.num_layers
+        slot0 = int(self.engine.page_table[req.table_idx, 0].item())
+        # Same flat-row view store_kv scatters through.
+        storage_shape = kvcache._storage_shape
+        kvcache.k_cache(layer_id).view(storage_shape)[slot0].zero_()
+        kvcache.v_cache(layer_id).view(storage_shape)[slot0].zero_()
+        ring = kvcache.pending_ring(backend._idx_slot[layer_id])
+        ring[req.table_idx, 0].zero_()
+
     def update_prefill(
         self,
         batch: Batch,
@@ -597,6 +731,8 @@ class MTPWorker:
         req = batch.reqs[0]
         if start == 0:
             self.reset(req.uid)
+            if self.pos_shift:
+                self._seed_predictor_origin(req)
         else:
             self._activate(req.uid)
         if expanded_hidden.shape[0] != end - start:
@@ -778,6 +914,8 @@ class MTPWorker:
         self.metrics.proposed_drafts += draft_tokens.numel()
         self.metrics.accepted_drafts += accepted_count
         self.metrics.emitted_tokens += output.numel()
+        if self.dynamic_enabled:
+            self._adjust_draft_depth(accepted_count, draft_tokens.numel())
         if self.fallback_enabled:
             self._accept_history.append(accepted_count)
             self._request_cycles += 1
@@ -852,17 +990,23 @@ class MTPWorker:
                 count = min(self.max_predictor_chunk, token_ids.numel() - offset)
                 start = source_start + offset
                 end = start + count
+                # Staging coordinates carry the experimental row shift;
+                # predictor_cached_len bookkeeping below stays unshifted.
+                row_start = start + self.pos_shift
+                row_end = end + self.pos_shift
                 batch.phase = "prefill"
                 batch.padded_reqs = batch.reqs
                 batch.input_ids = token_ids[offset : offset + count]
                 batch.positions = torch.arange(
-                    start, end, dtype=torch.int32, device=self.engine.device
+                    row_start, row_end, dtype=torch.int32, device=self.engine.device
                 )
-                batch.out_loc = self.engine.page_table[req.table_idx, start:end]
+                batch.out_loc = self.engine.page_table[
+                    req.table_idx, row_start:row_end
+                ]
                 batch.fla_metadata = None
                 batch.moe_decode_cache = True
-                req.cached_len = start
-                req.device_len = end
+                req.cached_len = row_start
+                req.device_len = row_end
                 self.engine.attn_backend.prepare_metadata(batch)
                 with self.engine.ctx.forward_batch(batch):
                     last_logits, last_expanded = self.model.mtp_forward(

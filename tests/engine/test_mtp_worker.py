@@ -13,7 +13,11 @@ from freetoken.engine.mtp_worker import (
     _mtp_adaptive_enabled,
     _mtp_adaptive_min_yield,
     _mtp_draft_p_min,
+    _mtp_dynamic_drafts_enabled,
+    _mtp_dynamic_thresholds,
+    _mtp_dynamic_window,
     _mtp_max_drafts,
+    _mtp_pos_shift,
 )
 
 
@@ -56,6 +60,26 @@ def test_mtp_draft_environment_is_validated(monkeypatch):
     with pytest.raises(ValueError, match="non-negative"):
         _mtp_adaptive_min_yield()
 
+    assert _mtp_pos_shift() == 0
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_POS_SHIFT", "1")
+    assert _mtp_pos_shift() == 1
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_POS_SHIFT", "2")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        _mtp_pos_shift()
+
+    assert not _mtp_dynamic_drafts_enabled()
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_DYNAMIC_DRAFTS", "on")
+    assert _mtp_dynamic_drafts_enabled()
+    assert _mtp_dynamic_window() == 32
+    assert _mtp_dynamic_thresholds() == (0.85, 0.72)
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_DYNAMIC_WINDOW", "0")
+    with pytest.raises(ValueError, match="positive"):
+        _mtp_dynamic_window()
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_DYNAMIC_HI", "0.5")
+    monkeypatch.setenv("FREETOKEN_QWEN4_MTP_DYNAMIC_LO", "0.7")
+    with pytest.raises(ValueError, match="LO <= HI"):
+        _mtp_dynamic_thresholds()
+
 
 def test_mtp_can_speculate_only_for_initialized_single_request():
     req = _req([10, 11, 12])
@@ -96,9 +120,11 @@ def test_mtp_prefill_keeps_hidden_and_next_token_alignment_across_chunks():
     worker.max_supported_drafts = 1
     worker.max_drafts = 1
     worker.draft_p_min = 0.0
+    worker.pos_shift = 0
     worker.fallback_uid = None
     worker._accept_history = deque(maxlen=64)
     worker._request_cycles = 0
+    worker._dyn_history = deque(maxlen=32)
     calls = []
 
     def run_predictor(self, batch, req, hidden, token_ids, source_start):
@@ -186,6 +212,12 @@ def _decode_worker(
     worker.fallback_uid = None
     worker._accept_history = deque(maxlen=64)
     worker._request_cycles = 0
+    worker.pos_shift = 0
+    worker.dynamic_enabled = False
+    worker.dynamic_window = 4
+    worker.dynamic_hi = 0.85
+    worker.dynamic_lo = 0.72
+    worker._dyn_history = deque(maxlen=4)
     extensions = []
     predictors = []
     prefix_commits = []
@@ -492,3 +524,113 @@ def test_mtp_second_draft_confidence_gate_verifies_only_first_draft():
     assert predictors[1][2].tolist() == [7, 9]
     assert not prefix_commits
     assert worker.metrics.proposed_drafts == 1
+
+
+def test_mtp_dynamic_drafts_step_toward_band_depth():
+    worker = object.__new__(MTPWorker)
+    worker.max_supported_drafts = 3
+    worker.max_drafts = 3
+    worker.dynamic_enabled = True
+    worker.dynamic_window = 4
+    worker.dynamic_hi = 0.85
+    worker.dynamic_lo = 0.72
+    worker._dyn_history = deque(maxlen=4)
+
+    for _ in range(4):
+        worker._adjust_draft_depth(1, 3)  # acceptance 0.33: band depth 1
+    assert worker.max_drafts == 2
+    assert not worker._dyn_history  # cleared after a step
+    for _ in range(4):
+        worker._adjust_draft_depth(0, 2)
+    assert worker.max_drafts == 1
+    for _ in range(4):
+        worker._adjust_draft_depth(1, 1)  # acceptance 1.0: band depth 3
+    assert worker.max_drafts == 2
+    for _ in range(4):
+        worker._adjust_draft_depth(2, 2)
+    assert worker.max_drafts == 3
+    worker.max_drafts = 2
+    worker._dyn_history.clear()
+    for _ in range(8):
+        worker._adjust_draft_depth(3, 4)  # acceptance 0.75: mid band holds 2
+    assert worker.max_drafts == 2
+
+
+def test_mtp_pos_shift_moves_predictor_rows_only():
+    import contextlib
+
+    req = _req([10, 11, 12, 13])
+    req.cached_len = 3
+    req.device_len = 4
+    batch = Batch(reqs=[req], phase="decode")
+    batch.input_ids = torch.tensor([13], dtype=torch.int32)
+    batch.positions = torch.tensor([3], dtype=torch.int32)
+    batch.out_loc = torch.tensor([3], dtype=torch.int32)
+    batch.padded_reqs = batch.reqs
+    batch.fla_metadata = None
+    batch.moe_decode_cache = False
+
+    worker = object.__new__(MTPWorker)
+    staged = []
+
+    def prepare_metadata(b):
+        staged.append(
+            (
+                b.positions.clone(),
+                b.out_loc.clone(),
+                b.reqs[0].cached_len,
+                b.reqs[0].device_len,
+            )
+        )
+
+    worker.engine = SimpleNamespace(
+        device=torch.device("cpu"),
+        page_table=torch.arange(64, dtype=torch.int32).unsqueeze(0),
+        attn_backend=SimpleNamespace(prepare_metadata=prepare_metadata),
+        ctx=SimpleNamespace(forward_batch=lambda b: contextlib.nullcontext()),
+    )
+    worker.model = SimpleNamespace(
+        mtp_forward=lambda hidden, tokens: (torch.zeros(tokens.numel(), 4), hidden)
+    )
+    worker.max_predictor_chunk = 8
+    worker.predictor_graphs = {}
+    worker.pos_shift = 1
+    worker.predictor_cached_len = 3
+
+    worker._run_predictor(
+        batch, req, torch.tensor([[1.0]]), torch.tensor([13], dtype=torch.int32), 3
+    )
+
+    positions, out_loc, cached_len, device_len = staged[0]
+    assert positions.tolist() == [4]
+    assert out_loc.tolist() == [4]
+    assert (cached_len, device_len) == (4, 5)
+    # Bookkeeping and the restored request state stay unshifted.
+    assert worker.predictor_cached_len == 4
+    assert req.cached_len == 3 and req.device_len == 4
+
+
+def test_mtp_seed_predictor_origin_zeroes_slot0_rows():
+    req = _req([10, 11, 12])
+    worker = object.__new__(MTPWorker)
+    storage = (4, 2, 2)
+    k = torch.ones(storage)
+    v = torch.ones(storage)
+    ring = torch.ones(3, 4, 2)
+    kvcache = SimpleNamespace(
+        _storage_shape=storage,
+        k_cache=lambda layer_id: k,
+        v_cache=lambda layer_id: v,
+        pending_ring=lambda slot: ring,
+    )
+    worker.engine = SimpleNamespace(
+        page_table=torch.tensor([[2, 3]], dtype=torch.int32),
+        attn_backend=SimpleNamespace(kvcache=kvcache, _idx_slot={8: 5}),
+        config=SimpleNamespace(model_config=SimpleNamespace(num_layers=8)),
+    )
+
+    worker._seed_predictor_origin(req)
+
+    assert k[2].abs().sum() == 0 and v[2].abs().sum() == 0
+    assert k[1].abs().sum() != 0 and k[3].abs().sum() != 0
+    assert ring[0, 0].abs().sum() == 0 and ring[0, 1].abs().sum() != 0

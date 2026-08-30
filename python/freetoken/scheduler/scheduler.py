@@ -536,8 +536,15 @@ class Scheduler(SchedulerIOMixin):
         allocated_end = batch.speculative_allocated_ends.pop(req, None)
         if allocated_end is None:
             return
+        # With pos_shift the newest predictor row sits one slot past the
+        # committed target rows; keep it so a page-boundary release cannot
+        # discard live predictor KV.
+        mtp_worker = self.engine.mtp_worker
+        keep_end = req.cached_len + (
+            mtp_worker.pos_shift if mtp_worker is not None else 0
+        )
         self.cache_manager.release_allocated_tail(
-            req, keep_end=req.cached_len, allocated_end=allocated_end
+            req, keep_end=min(keep_end, allocated_end), allocated_end=allocated_end
         )
 
     def _match_stop_str(self, req: Req) -> str | None:
@@ -904,7 +911,9 @@ class Scheduler(SchedulerIOMixin):
         mtp_worker = self.engine.mtp_worker
         if mtp_worker is not None and mtp_worker.can_speculate(batch):
             # Reserve decode pages for the draft rows; the drain returns any
-            # rejected tail through release_allocated_tail.
+            # rejected tail through release_allocated_tail. pos_shift moves the
+            # predictor rows one slot past the target rows, so it widens the
+            # reservation by one.
             req = batch.reqs[0]
             reserve_drafts = min(
                 mtp_worker.max_drafts,
@@ -912,7 +921,21 @@ class Scheduler(SchedulerIOMixin):
                 req.remain_len - 1,
             )
             original_end = req.device_len
-            allocated_end = original_end + reserve_drafts
+            allocated_end = original_end + reserve_drafts + mtp_worker.pos_shift
+            req.device_len = allocated_end
+            speculative.append((req, original_end, allocated_end))
+        elif (
+            mtp_worker is not None
+            and mtp_worker.pos_shift
+            and batch.is_prefill
+            and batch.size == 1
+        ):
+            # Shifted predictor prefill writes one row past the prompt chunk;
+            # reserve that slot so a page-boundary chunk cannot land the row on
+            # an unallocated page. Released with the shifted keep_end below.
+            req = batch.reqs[0]
+            original_end = req.device_len
+            allocated_end = original_end + mtp_worker.pos_shift
             req.device_len = allocated_end
             speculative.append((req, original_end, allocated_end))
         try:
