@@ -39,6 +39,9 @@ Off by default. Everything is opt-in via environment variables:
 | `FREETOKEN_QWEN4_MTP_DRAFT_P_MIN` | `0` | confidence gate (0.6 measured best) |
 | `FREETOKEN_QWEN4_MTP_EXPERT_QUANT` | `bf16` | predictor expert bank: `bf16` or `fp8_block` |
 | `FREETOKEN_QWEN4_MTP_MOE_CACHE_SIZE` | `64` | predictor GPU expert-cache slots |
+| `FREETOKEN_QWEN4_MTP_ADAPTIVE` | `1` | request-local fallback to ordinary decode |
+| `FREETOKEN_QWEN4_MTP_ADAPTIVE_CYCLES` | `64` | observation window before the fallback decision |
+| `FREETOKEN_QWEN4_MTP_ADAPTIVE_MIN_ACCEPTANCE` | `0.75` | minimum accepted drafts per cycle to keep speculating |
 
 Current restrictions: greedy sampling, one running request, TP=1, offload
 family MoE backends, naive cache (forced automatically). The API only takes
@@ -93,10 +96,16 @@ cheaper predictor prefill is the main follow-up.
 Known worst case: content the predictor cannot anticipate (e.g. gibberish
 input) makes most cycles all-rejection - each costs about 2.5x an ordinary
 token and yields one token - and short confused replies also amortize the
-per-request prefill badly; measured as low as ~12 tok/s wall-clock. A
-request-local fallback that watches the accepted yield and reverts to
-ordinary decode (measured on the implementation this was ported from) is the
-intended follow-up for this.
+per-request prefill badly; measured as low as ~12 tok/s wall-clock before the
+fallback below existed. A request-local fallback (on by default) now bounds
+this: after 64 observed cycles, a rolling accepted yield below 0.75 drafts
+per cycle reverts the request to ordinary decode one-way, and the request
+also regains overlap scheduling. The switch is one-way because ordinary
+decode does not advance the recursive predictor state. Replies shorter than
+the observation window still pay the unmitigated cost; the window follows
+the measurements of the implementation this was ported from, whose recorded
+traces showed that a smaller fixed window mis-cancels prompts whose
+acceptance climbs late.
 
 ## The detokenizer fix (first commit, independent of MTP)
 
