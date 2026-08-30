@@ -97,7 +97,19 @@ Known worst case: content the predictor cannot anticipate (e.g. gibberish
 input) makes most cycles all-rejection - each costs about 2.5x an ordinary
 token and yields one token - and short confused replies also amortize the
 per-request prefill badly; measured as low as ~12 tok/s wall-clock before the
-fallback below existed. A request-local fallback (on by default) now bounds
+fallback below existed.
+
+The 2.5x cycle cost is a property of the expert-offload backend, not of MTP
+itself: the verify rows mostly activate distinct experts, so the PCIe expert
+traffic that dominates decode here scales with row count, putting the
+break-even acceptance near 75-80%. With VRAM-resident experts the extra
+verify rows would be nearly free (weight reads dominate and are shared
+across rows), break-even would drop to a few tens of percent, and this worst
+case would largely disappear - which matches MTP results reported on models
+that fit their GPU. The fallback exists to bound the offload case, currently
+the only backend family MTP supports here.
+
+A request-local fallback (on by default) now bounds
 this: after 64 observed cycles, a rolling accepted yield below 0.75 drafts
 per cycle reverts the request to ordinary decode one-way, and the request
 also regains overlap scheduling. The switch is one-way because ordinary
