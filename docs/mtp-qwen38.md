@@ -90,6 +90,14 @@ this machine (more when cold), so short outputs are end-to-end neutral to
 negative; long generations converge to the decode ratios above. Lazy or
 cheaper predictor prefill is the main follow-up.
 
+Known worst case: content the predictor cannot anticipate (e.g. gibberish
+input) makes most cycles all-rejection - each costs about 2.5x an ordinary
+token and yields one token - and short confused replies also amortize the
+per-request prefill badly; measured as low as ~12 tok/s wall-clock. A
+request-local fallback that watches the accepted yield and reverts to
+ordinary decode (measured on the implementation this was ported from) is the
+intended follow-up for this.
+
 ## The detokenizer fix (first commit, independent of MTP)
 
 `fix(tokenizer): keep streamed deltas incremental when one uid repeats in a
